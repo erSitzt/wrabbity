@@ -1,5 +1,6 @@
 
 const amqplib = require('./node_modules/amqplib'); // amqplib is the Bibliothek that implement the AMQP Protocol
+const genericPool = require("generic-pool");
 const { v4: uuidv4 } = require('uuid'); // lightweight library to generate a uuid 
 
 
@@ -41,16 +42,31 @@ class Wrabbity {
        try {
 
         const connection = await amqplib.connect(host);
+        const channelFactory = {
+            create: async function() {
+                const channel = await connection.createChannel();
+                channel.prefetch(1);
+                return channel;
+            },
+            destroy: function(channel) {
+              channel.close();
+            }
+          };
+          const opts = {
+            max: 10, // maximum size of the pool
+            min: 2 // minimum size of the pool
+          };
+          
+          const channelPool = genericPool.createPool(channelFactory, opts);
 
-        const channel = await connection.createChannel();
 
-        channel.prefetch(1);
+
 
         //console.log(' [x] Awaiting RPC requests');
 
         this.connection = connection; 
   
-        this.channel = channel;
+        this.channelPool = channelPool;
       } 
 
       catch (err) {
@@ -69,12 +85,17 @@ class Wrabbity {
             -qOptions : Options of the queue set to default value : durable = false (if true the queue will survive broker restart)
         */
        //#endregion
-      
-       await this.channel.assertQueue(queue, qOptions);
+       let pool = this.channelPool
+       pool.acquire().then(async function(channel) {
+            await channel.assertQueue(queue, qOptions);
+            await channel.sendToQueue(queue, Buffer.from(message));
+           pool.release(channel);
+       });
 
-      this.channel.sendToQueue(queue, Buffer.from(message));
 
-      console.log("msg sent ");
+
+
+      //console.log("msg sent ");
     }
 
     // basic function receiver => this will receive a Message from a queue (there is no exchange middleware) based on queue name. queue options will describe if the queue will be durable, exclusive etc.. it is set to a default value
@@ -86,14 +107,20 @@ class Wrabbity {
             -ack_options are the acknowledge options, if we want to acknowledge the message that property noAck should set to false 
          */
          //#endregion
-       
-         await this.channel.assertQueue(queue, qOptions);
-
-        await this.channel.consume(queue, function (msg) {
+         let pool = this.channelPool
+         pool.acquire().then(async function(channel) {
+              await channel.assertQueue(queue, qOptions);
+              await channel.consume(queue, function (msg) {
             
-        callback(msg);
+                callback(msg);
+        
+              }, ack_options);
+             pool.release(channel);
+         });
 
-      }, ack_options);
+
+
+
     }
 
     // Consume a Request from a Client, make some Processing and then return a Response based on that (this function Implements the RPC Pattern)
