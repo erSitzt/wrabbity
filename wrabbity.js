@@ -1,5 +1,5 @@
 
-const amqplib = require('./node_modules/amqplib'); // amqplib is the Bibliothek that implement the AMQP Protocol
+const amqplib = require("amqplib"); // amqplib is the Bibliothek that implement the AMQP Protocol
 const genericPool = require("generic-pool");
 const { v4: uuidv4 } = require('uuid'); // lightweight library to generate a uuid 
 
@@ -21,8 +21,10 @@ class Wrabbity {
 
     // close connection with rabbitmq
     async close() {
-        if (this.channel) await this.channel.close();
-        await this.connection.close();
+        let pool = this.channelPool
+        this.channelPool.drain().then(function() {
+            pool.clear();
+          });
       }
   
     // initialize Connection and open Channel with rabbitmq
@@ -48,8 +50,8 @@ class Wrabbity {
                 channel.prefetch(1);
                 return channel;
             },
-            destroy: function(channel) {
-              channel.close();
+            destroy: async function(channel) {
+              await channel.close();
             }
           };
           const opts = {
@@ -287,19 +289,25 @@ class Wrabbity {
 
         let res = response;
 
-        channel.assertExchange(ex, 'direct', {durable : true});
+        let pool = this.channelPool
+        pool.acquire().then(async function(channel) {
+            channel.assertExchange(ex, 'direct', {durable : true});
 
-        let q = await channel.assertQueue(consumeQueue, qOptions); // Declare a Queue with that queueName and some Options
+            let q = await channel.assertQueue(consumeQueue, qOptions); // Declare a Queue with that queueName and some Options
+    
+            channel.bindQueue(q.queue, ex, routingKey);
+    
+            await channel.consume(q.queue, msg=> { // consume msg from that exchange according to some Parameters 
+            
+                callback(msg, response);
+    
+                sendReturn(channel, msg, res);
+    
+                }, ack_options);
+            pool.release(channel);
+        });
 
-        channel.bindQueue(q.queue, ex, routingKey);
 
-        await channel.consume(q.queue, msg=> { // consume msg from that exchange according to some Parameters 
-        
-            callback(msg, response);
-
-            sendReturn(channel, msg, res);
-
-            }, ack_options);
      
     }
 
@@ -345,24 +353,33 @@ class Wrabbity {
           
         */
        //#endregion
+       let corr = uuidv4();
 
-        let corr = uuidv4();
+       let ex = executerName + '_tasks';
 
-        let ex = executerName + '_tasks';
+       let pool = this.channelPool
+       pool.acquire().then(async function(channel) {
+            channel.assertExchange(ex, 'direct', {durable : true});
+            let q = await channel.assertQueue(replyToQueue, qOptions);
+
+            channel.publish(ex, routingKey, Buffer.from( JSON.stringify(request)), { correlationId: corr, replyTo: q.queue });
+    
+            console.log(' [x] Requesting response for this msg', request);
+    
+            channel.consume(q.queue, msg => {
+    
+                callback(msg, corr);
+    
+            }, ack_options);
+           pool.release(channel);
+       });
+
+              
+
         
-        channel.assertExchange(ex, 'direct', {durable : true});
+        
 
-        let q = await channel.assertQueue(replyToQueue, qOptions);
 
-        channel.publish(ex, routingKey, Buffer.from( JSON.stringify(request)), { correlationId: corr, replyTo: q.queue });
-
-        console.log(' [x] Requesting response for this msg', request);
-
-        channel.consume(q.queue, msg => {
-
-            callback(msg, corr);
-
-        }, ack_options);
     }
 
     // this function will be fired as Event when a Task Client will receive the Response of his Request => define your own function before calling taskRequest and passing this function as an argument
